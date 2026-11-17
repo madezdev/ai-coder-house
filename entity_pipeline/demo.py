@@ -35,13 +35,19 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_TOKENS,
         help="Límite de tokens de salida. Con un valor bajo (ej. 30) se ven los reintentos.",
     )
+    parser.add_argument(
+        "--piso",
+        action="store_true",
+        help="Aplica el piso de criticidad con reglas fijas (extra, desactivado por defecto).",
+    )
     return parser.parse_args()
 
 
-async def run(texts: dict[str, str], max_tokens: int) -> int:
+async def run(texts: dict[str, str], max_tokens: int, apply_floor: bool = False) -> int:
     chain = chain_from_env(max_tokens=max_tokens)
     results = await asyncio.gather(
-        *(process_text(text, chain=chain) for text in texts.values()), return_exceptions=True
+        *(process_text(text, chain=chain, apply_floor=apply_floor) for text in texts.values()),
+        return_exceptions=True,
     )
     failures = 0
     for label, result in zip(texts, results, strict=True):
@@ -64,7 +70,7 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     texts = {"texto recibido": args.texto} if args.texto is not None else SAMPLES
     try:
-        failures = asyncio.run(run(texts, args.max_tokens))
+        failures = asyncio.run(run(texts, args.max_tokens, args.piso))
     except ValueError as exc:
         raise SystemExit(f"Configuración inválida: {exc}") from exc
     raise SystemExit(1 if failures else 0)
