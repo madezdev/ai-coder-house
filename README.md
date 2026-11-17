@@ -34,6 +34,8 @@ entity_pipeline/
 ├── errors.py           # Errores del pipeline
 ├── guardrails.py       # Piso de criticidad con reglas fijas
 └── demo.py             # Prueba asíncrona con textos de ejemplo
+ejercicios/
+└── llamadas_async/     # Ejercicio de asyncio: gather, timeout y semáforo
 main.py                 # Prueba manual
 tests/                  # Pruebas unitarias
 ```
@@ -261,3 +263,7 @@ except ExtractionError as exc:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Ejercicios
+
+- [`ejercicios/llamadas_async/`](ejercicios/llamadas_async/README.md): simulación de llamadas concurrentes a tres LLMs con `asyncio.gather`, un timeout global, un semáforo que limita la concurrencia y un timeout por llamada. Usa solo la biblioteca estándar, así que no necesita claves de API.
