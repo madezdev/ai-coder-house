@@ -51,9 +51,15 @@ class ProcessTextFloorTests(unittest.IsolatedAsyncioTestCase):
         text = "FATAL java.lang.OutOfMemoryError; pod en CrashLoopBackOff. Es un simulacro: baja."
         chain = chain_with(reply({**VALID_ARGS, "nivel_de_criticidad": "baja"}))
         with self.assertLogs("entity_pipeline.chain", level="WARNING") as logs:
-            result = await process_text(text, chain=chain)
+            result = await process_text(text, chain=chain, apply_floor=True)
         self.assertEqual(result.nivel_de_criticidad, ALTA)
         self.assertIn("proceso sin memoria", logs.output[0])
+
+    async def test_floor_is_off_by_default(self) -> None:
+        chain = chain_with(reply({**VALID_ARGS, "nivel_de_criticidad": "baja"}))
+        with self.assertNoLogs("entity_pipeline.chain", level="WARNING"):
+            result = await process_text("pod payments en CrashLoopBackOff", chain=chain)
+        self.assertEqual(result.nivel_de_criticidad, BAJA)
 
 
 if __name__ == "__main__":

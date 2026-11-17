@@ -93,6 +93,7 @@ def build_chat_model(config: ModelConfig, api_key: str) -> BaseChatModel:
         "max_tokens": config.max_tokens,
         "timeout": REQUEST_TIMEOUT_SECONDS,
         # The SDK already retries 429, 5xx and connection errors; with_retry handles bad output.
+        # Neither retries the other's errors: an outage costs 3 requests, the worst case 9.
         "max_retries": 2,
     }
     if config.provider == "openai":
@@ -221,10 +222,27 @@ def _clean_input(text: str) -> str:
     return content
 
 
-async def process_text(text: str, *, chain: ExtractionChain | None = None) -> TechnicalExtraction:
+def _raise_to_floor(
+    content: str, result: TechnicalExtraction, request_id: str
+) -> TechnicalExtraction:
+    raised, signal = apply_criticality_floor(content, result)
+    if signal:
+        logger.warning(
+            "[%s] Criticidad elevada a %s por regla fija: %s",
+            request_id,
+            raised.nivel_de_criticidad,
+            signal,
+        )
+    return raised
+
+
+async def process_text(
+    text: str, *, chain: ExtractionChain | None = None, apply_floor: bool = False
+) -> TechnicalExtraction:
     """Extract and validate the technical entities in ``text``.
 
-    The criticality never ends below the floor set by deterministic signals in the text.
+    With ``apply_floor``, the criticality never ends below the floor set by deterministic
+    signals in the text. It is off by default because the rules can fire on false positives.
     Raises TypeError or ValueError for invalid input, and ExtractionError when no valid
     object is obtained after the retries.
     """
@@ -259,14 +277,8 @@ async def process_text(text: str, *, chain: ExtractionChain | None = None) -> Te
         raise ProviderError(
             "Respuesta inesperada del proveedor.", code="api_error", retryable=False
         ) from exc
-    result, floor_signal = apply_criticality_floor(content, result)
-    if floor_signal:
-        logger.warning(
-            "[%s] Criticidad elevada a %s por regla fija: %s",
-            request_id,
-            result.nivel_de_criticidad,
-            floor_signal,
-        )
+    if apply_floor:
+        result = _raise_to_floor(content, result, request_id)
     logger.info(
         "[%s] Extracción completada en %d intento(s) y %.2f s: %d tecnologías, criticidad %s",
         request_id,
