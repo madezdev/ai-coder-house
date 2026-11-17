@@ -135,9 +135,19 @@ def anthropic_body(stop_reason: str, tool_input: dict[str, Any]) -> dict:
     }
 
 
+def unavailable() -> httpx.Response:
+    # retry-after-ms keeps the SDK's backoff at 1 ms instead of its default of up to 8 s.
+    return httpx.Response(503, headers={"retry-after-ms": "1"}, json={"error": {"message": "down"}})
+
+
 class MockedProviderCase(unittest.IsolatedAsyncioTestCase):
-    def provider_chain(self, provider: str, *responses: dict | httpx.Response):
-        """build_chat_model's real client, with the HTTP layer answered by ``responses`` in order."""
+    def provider_chain(
+        self, provider: str, *responses: dict | httpx.Response, sdk_retries: bool = False
+    ):
+        """build_chat_model's real client, with the HTTP layer answered by ``responses`` in order.
+
+        With ``sdk_retries`` the client keeps the SDK retries that build_chat_model sets.
+        """
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -149,15 +159,22 @@ class MockedProviderCase(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(http.aclose)
         config = ModelConfig(provider=provider, model="m", temperature=0, max_tokens=64)
         model = build_chat_model(config, FAKE_KEY)
+        max_retries = model.max_retries if sdk_retries else 0
         if provider == "openai":
             client = openai.AsyncOpenAI(
-                api_key=FAKE_KEY, base_url="http://mock.invalid/v1", http_client=http, max_retries=0
+                api_key=FAKE_KEY,
+                base_url="http://mock.invalid/v1",
+                http_client=http,
+                max_retries=max_retries,
             )
             model.root_async_client = client
             model.async_client = client.chat.completions
         else:
             model.__dict__["_async_client"] = anthropic.AsyncAnthropic(
-                api_key=FAKE_KEY, base_url="http://mock.invalid", http_client=http, max_retries=0
+                api_key=FAKE_KEY,
+                base_url="http://mock.invalid",
+                http_client=http,
+                max_retries=max_retries,
             )
         return build_chain(model, wait_between_attempts=False), requests
 
@@ -225,6 +242,31 @@ class RealClientRefusalAndFailureTests(MockedProviderCase):
                 except Exception as exc:  # noqa: BLE001 - the leaked type is the finding
                     self.fail(f"se escapó {type(exc).__name__}: {str(exc)[:80]}")
                 self.fail("devolvió un objeto con una respuesta inválida")
+
+
+class TwoRetryLevelsTests(MockedProviderCase):
+    """The SDK retries transport errors and with_retry bad output; neither retries the other's."""
+
+    async def test_an_outage_costs_three_requests_and_no_chain_retry(self) -> None:
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider):
+                chain, requests = self.provider_chain(
+                    provider, *(unavailable() for _ in range(3)), sdk_retries=True
+                )
+                with self.assertLogs(LOGGER, level="INFO") as logs, self.assertRaises(ProviderError):
+                    await process_text("ERROR redis", chain=chain)
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(sum("Intento" in line for line in logs.output), 1)
+
+    async def test_worst_case_is_three_attempts_of_three_requests(self) -> None:
+        cut = openai_body("length", '{"tecnologias": ["Redis"], "nivel_de_crit')
+        attempt = (unavailable, unavailable, lambda: cut)
+        chain, requests = self.provider_chain(
+            "openai", *(make() for _ in range(3) for make in attempt), sdk_retries=True
+        )
+        with self.assertRaises(TruncatedOutputError):
+            await process_text("ERROR redis", chain=chain)
+        self.assertEqual(len(requests), 9)
 
 
 class RetryOrderTests(unittest.IsolatedAsyncioTestCase):
