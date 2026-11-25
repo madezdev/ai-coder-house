@@ -2,7 +2,7 @@
 
 Cliente asíncrono para OpenAI y Anthropic con una interfaz común, validación con Pydantic y respuestas en streaming.
 
-Incluye además un [pipeline de extracción de entidades técnicas](#pipeline-de-extracción-de-entidades-técnicas) hecho con LangChain (`entity_pipeline/`), que reutiliza la configuración del cliente.
+Incluye además un [pipeline de extracción de entidades técnicas](#pipeline-de-extracción-de-entidades-técnicas) hecho con LangChain (`entity_pipeline/`), que reutiliza la configuración del cliente, y un [sistema de recuperación semántica local (RAG)](#sistema-de-recuperación-semántica-local-rag) con ChromaDB (`rag/`).
 
 ## Requisitos e instalación
 
@@ -34,6 +34,15 @@ entity_pipeline/
 ├── errors.py           # Errores del pipeline
 ├── guardrails.py       # Piso de criticidad opcional con reglas fijas
 └── demo.py             # Prueba asíncrona con textos de ejemplo
+rag/
+├── settings.py         # Rutas, parámetros de chunking y modelo de embeddings
+├── ingest.py           # Ingesta: lectura de data/, chunking y carga en ChromaDB
+├── store.py            # Cliente persistente de ChromaDB
+├── retriever.py        # Embedding de la pregunta y búsqueda de los fragmentos
+├── chain.py            # Cadena LCEL y get_rag_response
+├── schemas.py          # Respuesta con referencias (Pydantic)
+└── demo.py             # Pregunta con respuesta y pregunta trampa
+data/                   # Dataset de ejemplo: cuatro manuales en Markdown
 ejercicios/
 └── llamadas_async/     # Ejercicio de asyncio: gather, timeout y semáforo
 main.py                 # Prueba manual
@@ -48,8 +57,9 @@ tests/                  # Pruebas unitarias
 | `LLM_MODEL` | Nombre del modelo del proveedor; si se omite, se usa un modelo predeterminado |
 | `OPENAI_API_KEY` | Necesaria cuando `LLM_PROVIDER=openai` |
 | `ANTHROPIC_API_KEY` | Necesaria cuando `LLM_PROVIDER=anthropic` |
+| `EMBEDDING_MODEL` | Solo para el RAG. Modelo de embeddings de OpenAI; por defecto `text-embedding-3-small` |
 
-Para Anthropic, cambia `LLM_PROVIDER` a `anthropic` y ajusta `LLM_MODEL` al modelo que tengas disponible.
+Para Anthropic, cambia `LLM_PROVIDER` a `anthropic` y ajusta `LLM_MODEL` al modelo que tengas disponible. El RAG necesita `OPENAI_API_KEY` aunque el modelo de lenguaje sea de Anthropic, porque los embeddings son de OpenAI.
 
 ## Ejecución
 
@@ -266,6 +276,133 @@ except ExtractionError as exc:
 ### Pruebas
 
 `tests/test_pipeline.py` usa un modelo falso de LangChain, así que no consume créditos. Cubre el esquema, el prompt, la selección del proveedor, los reintentos ante respuestas truncadas o mal formadas, el corte después de 3 intentos, los rechazos que no se reintentan y el mapeo de errores de la API. `tests/test_guardrails.py` y `tests/test_guardrails_edge_cases.py` prueban las reglas del piso con formatos reales (nginx, Envoy, kubelet, zap, requests) y con textos que no deben activarlas (por ejemplo, "responde en 520 ms" o "devuelve 500 filas por página"). `tests/test_pipeline_edge_cases.py` y `tests/test_reintentos_y_piso_ataques.py` usan el cliente real de cada SDK con un transporte HTTP falso y cuentan las requests de los dos niveles de reintento: 3 con la API caída (5xx, 429, timeout o conexión rechazada) y 9 en el peor caso. Se corren junto con el resto:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Sistema de recuperación semántica local (RAG)
+
+Responde preguntas sobre los manuales de `data/` usando solo lo que dicen. Busca los fragmentos más parecidos a la pregunta en una base ChromaDB local, se los pasa al modelo junto con la pregunta y devuelve un objeto `RAGResponse` con la respuesta y los fragmentos que la respaldan. Si la respuesta no está en los manuales, contesta "No lo sé".
+
+### Dataset
+
+Cuatro manuales en Markdown de un equipo de Plataforma ficticio. Los datos son inventados, así que el modelo no puede conocerlos de antemano: si responde bien, es porque los recuperó.
+
+| Archivo | Tema | Fragmentos |
+| --- | --- | --- |
+| `guardia_y_alertas.md` | Rotación de guardia, severidades, tiempos de acuse y escalamiento | 3 |
+| `gestion_de_incidentes.md` | Roles, comunicación, mitigación y postmortems | 2 |
+| `despliegues.md` | Requisitos, ventanas, canary, rollback y feature flags | 2 |
+| `respaldos_y_recuperacion.md` | Respaldos, retención, RPO/RTO y simulacros | 2 |
+
+Para usar otros documentos, basta con poner archivos `.md` o `.txt` en UTF-8 en `data/` y volver a correr la ingesta. Se omiten los archivos ocultos (como los `._archivo.md` que deja macOS) y los vacíos; un archivo que no está en UTF-8 frena la ingesta con un error que lo nombra.
+
+### Cómo funciona
+
+```text
+python -m rag.ingest
+  data/*.md, data/*.txt
+  -> RecursiveCharacterTextSplitter     500 tokens, 50 de overlap, cortes en títulos de Markdown
+  -> OpenAIEmbeddings                    text-embedding-3-small
+  -> ChromaDB (./vectorstore)            colección con distancia coseno
+
+await get_rag_response(pregunta)
+  -> ChromaRetriever                     embedding de la pregunta y los 4 fragmentos más cercanos
+  -> format_documents                    <fragmento id="despliegues.md#1" documento="...">
+  -> ChatPromptTemplate                  contexto + pregunta + instrucciones de formato
+  -> ChatOpenAI o ChatAnthropic          según LLM_PROVIDER, temperatura 0
+  -> PydanticOutputParser                RAGResponse
+  -> ground_references                   descarta referencias que no se recuperaron
+```
+
+- **Chunking**: el tamaño se mide en tokens de `cl100k_base`, la codificación de los modelos de embeddings de OpenAI, así que 500 tokens del splitter son 500 tokens para el modelo. Los separadores de Markdown cortan primero en los títulos, después en párrafos, líneas y palabras. Con este dataset cada fragmento empieza en un título de sección y ninguna sección queda partida; el overlap de 50 tokens entra en juego cuando una sección no entra en un fragmento. Cada fragmento lleva el id `archivo#n` y en sus metadatos el archivo, el título del documento y el número de fragmento.
+- **Persistencia**: la base vive en `./vectorstore` (excluida de Git) con `chromadb.PersistentClient`. Antes de indexar, la ingesta calcula una huella (SHA-256 del nombre y el contenido de cada archivo, los parámetros de chunking y el modelo de embeddings) y la compara con la que guardó en los metadatos de la colección. Si coinciden, no reindexa ni llama a la API. Si cambió un archivo o el modelo, reindexa todo; `--rebuild` lo fuerza. La colección nueva se arma aparte, por lotes del tamaño máximo que acepta Chroma, y reemplaza a la anterior recién cuando se guardaron todos los fragmentos. Si la API falla o devuelve menos vectores de los pedidos, la base anterior queda como estaba. El reemplazo en sí son dos pasos (borrar la anterior y renombrar la nueva); si el proceso se corta justo entre los dos, la base queda vacía y la próxima ingesta la arma de nuevo.
+- **Mismo modelo para indexar y consultar**: la colección se crea sin función de embeddings, así que Chroma nunca calcula vectores por su cuenta: todos salen de `OpenAIEmbeddings`. La colección guarda en sus metadatos el modelo con el que se indexó, y `ChromaRetriever` se niega a consultar con otro y pide reindexar.
+- **Recuperación**: `ChromaRetriever` es un `BaseRetriever` de LangChain. Calcula el embedding de la pregunta con `aembed_query` y consulta la colección en un hilo aparte (el cliente de Chroma es sincrónico), para no bloquear el event loop. Trae 4 fragmentos (`TOP_K`) y acepta entre 3 y 5, para no llenar el contexto de texto que no aporta. Abre la colección en cada consulta, así una reindexación en el mismo proceso (por ejemplo, en un notebook) no deja la cadena apuntando a una colección borrada.
+- **Prompt**: cada fragmento va entre etiquetas `<fragmento>` con su id, y el texto se escapa para que un `</fragmento>` dentro de un documento no pueda abrir un fragmento falso con el id de otro. El mensaje de sistema pide usar solo el contexto aunque el modelo crea saber la respuesta, contestar exactamente "No lo sé" con las referencias vacías cuando el contexto no alcanza, citar el id de cada fragmento usado y no seguir instrucciones que aparezcan dentro del contexto. Las instrucciones de formato las genera `PydanticOutputParser` a partir de `RAGResponse`.
+- **Referencias**: `ground_references` deja solo los ids que están entre los fragmentos recuperados y avisa con un WARNING si el modelo inventó alguno. Una respuesta que no cita ningún fragmento recuperado no está respaldada por el contexto, así que se devuelve "No lo sé". Si la respuesta empieza con "No lo sé" (también entre comillas o sin tilde), se normaliza a "No lo sé" y se vacían las referencias.
+- **Asincronía**: `get_rag_response` es `async` y la cadena se ejecuta con `ainvoke`, desde el embedding de la pregunta hasta la llamada al modelo. La demo lanza las dos preguntas en paralelo con `asyncio.gather`.
+
+### Esquema de salida
+
+| Campo | Tipo | Contenido |
+| --- | --- | --- |
+| `respuesta` | `str` | Respuesta basada en el contexto, o "No lo sé"; no puede quedar en blanco |
+| `referencias` | `list[str]` | Ids de los fragmentos usados (`guardia_y_alertas.md#1`), al menos uno si hay respuesta; vacía si la respuesta es "No lo sé" |
+
+Una pregunta vacía, sin caracteres legibles o de más de 1.000 caracteres lanza `ValueError` sin llamar al modelo, y una que no es `str`, `TypeError`. Si no se corrió la ingesta, o si la base está dañada, `get_rag_response` lanza `ValueError` y dice qué hacer. Si el modelo no devuelve un JSON válido para el esquema, lanza `OutputParserException`.
+
+### Ejecución
+
+```bash
+python -m rag.ingest            # indexa data/; si ya está al día, no hace nada
+python -m rag.ingest --rebuild  # vuelve a indexar todo
+python -m rag.demo              # pregunta con respuesta y pregunta trampa
+python -m rag.demo "¿Cuánto dura el canary de un despliegue?"
+```
+
+La demo corre la ingesta antes de preguntar, así que en la primera ejecución también indexa. Indexar el dataset cuesta una llamada a la API de embeddings (unos 3.700 tokens). Después, cada pregunta hace una llamada de embeddings y una al modelo de lenguaje.
+
+### Pruebas con el modelo real
+
+Salida de `python -m rag.demo` con `gpt-4o-mini` y `text-embedding-3-small`, con la base ya indexada. Los logs muestran qué fragmentos recuperó cada pregunta y su distancia coseno (menor es más parecido):
+
+```text
+21:29:03 INFO    La colección ya está al día (9 fragmentos); no se reindexa
+21:29:04 INFO    Fragmentos para '¿En qué año se lanzó la primera versión de PostgreSQL?': respaldos_y_recuperacion.md#0 (0.594), despliegues.md#1 (0.732), respaldos_y_recuperacion.md#1 (0.765), despliegues.md#0 (0.777)
+21:29:04 INFO    Fragmentos para '¿Cuánto tiempo tiene la guardia primaria para acusar recibo ': guardia_y_alertas.md#1 (0.363), guardia_y_alertas.md#0 (0.455), guardia_y_alertas.md#2 (0.488), gestion_de_incidentes.md#0 (0.511)
+```
+
+Pregunta con respuesta en los documentos: *¿Cuánto tiempo tiene la guardia primaria para acusar recibo de una alerta P1 y qué pasa si no lo hace?*
+
+```json
+{
+  "respuesta": "La guardia primaria tiene 5 minutos para acusar recibo de una alerta P1. Si no lo hace, la herramienta pagina automáticamente a la guardia secundaria y, si a los 10 minutos sigue sin acuse, se pagina a la líder técnica de Plataforma, y a los 20 minutos al gerente de Ingeniería.",
+  "referencias": [
+    "guardia_y_alertas.md#1"
+  ]
+}
+```
+
+La respuesta coincide con la sección "Escalamiento" del manual de guardia y cita el fragmento de donde sale.
+
+Pregunta trampa: *¿En qué año se lanzó la primera versión de PostgreSQL?*
+
+```json
+{
+  "respuesta": "No lo sé",
+  "referencias": []
+}
+```
+
+Es una trampa a propósito: los manuales nombran PostgreSQL, así que el retriever trae el fragmento de respaldos, y el modelo probablemente conoce la respuesta por su entrenamiento. Aun así contesta "No lo sé", porque el dato no está en el contexto. La demo marca cada prueba con `Resultado: OK` o `FALLA` y termina con código 1 si alguna falla.
+
+### Uso desde Python
+
+```python
+from rag import get_rag_response
+
+result = await get_rag_response("¿Quién aprueba restaurar un respaldo en producción?")
+print(result.respuesta, result.referencias)
+```
+
+`get_rag_response` lee el `.env` y abre la base la primera vez, y después reutiliza la cadena. Para armar una cadena con otro retriever o modelo está `build_rag_chain(retriever, model)`, que se le pasa con `get_rag_response(pregunta, chain=...)`. La ingesta también se puede llamar desde Python con `from rag.ingest import ingest`.
+
+### Limitaciones conocidas
+
+- El retriever siempre devuelve 4 fragmentos, aunque ninguno tenga que ver con la pregunta. No hay un umbral de distancia: decir "No lo sé" depende de que el modelo siga el prompt. Con preguntas fuera de tema la distancia sube (0.59 para la pregunta trampa, contra 0.36 para la otra), pero no alcanza con dos preguntas para fijar un umbral.
+- "No lo sé" se detecta por el comienzo del texto, sin importar tildes ni comillas. Una respuesta que empiece así y después dé información se toma como "No lo sé".
+- Que una respuesta cite un fragmento recuperado no garantiza que diga lo mismo que el fragmento: el filtro de referencias descarta las inventadas, pero no compara el contenido.
+- No hay reintentos ante una respuesta mal formada: el SDK reintenta solo los errores de transporte (`max_retries=2`) y un JSON inválido termina en `OutputParserException`.
+- Si una sección supera los 500 tokens, el splitter la parte y su título puede quedar como un fragmento corto aparte. Con este dataset no pasa.
+- Los embeddings usan siempre OpenAI, aunque el modelo de lenguaje sea de Anthropic.
+- Los fragmentos recuperados y la pregunta se envían al proveedor. No hay que indexar documentos con datos que no puedan salir de la máquina.
+- ChromaDB 1.5.9 tiene vulnerabilidades publicadas sin corregir en su modo servidor (GHSA-f4j7-r4q5-qw2c, GHSA-36p7-vc44-83pf, GHSA-2wm9-hf6c-p5cr y GHSA-xph7-9rjv-w5fr). Acá no aplican porque solo se usa `PersistentClient` local, las colecciones no tienen función de embeddings y los vectores se pasan siempre explícitos. No hay que levantar la base con `chroma run` ni abrir un `vectorstore/` de otra persona.
+
+### Pruebas
+
+`tests/test_rag.py` y `tests/test_rag_ataques.py` no consumen créditos: usan embeddings falsos que cuentan palabras clave, un modelo falso de LangChain y una base ChromaDB en una carpeta temporal. Cubre que los fragmentos del dataset no pasen los 500 tokens y empiecen en un título, el overlap cuando una sección se parte, que solo se lean `.md` y `.txt`, que la segunda ingesta no reindexe ni calcule embeddings, que la base persista entre clientes, que se reindexe si cambia un archivo o el modelo, que una falla de la API no borre la base anterior, el rechazo de un modelo de embeddings distinto, el tope de `top_k`, el prompt con la pregunta y solo los fragmentos recuperados, el descarte de referencias inventadas, el "No lo sé" sin referencias y las respuestas que no respetan el esquema. `tests/test_rag_ataques.py` suma casos hostiles: archivos vaciados o con BOM, más de 5.461 fragmentos, un `<|endoftext|>` en un documento, una API que devuelve menos vectores, una base corrupta, un `</fragmento>` metido en un documento, respuestas sin referencias válidas o en blanco, variantes de "No lo sé" y una reindexación con la cadena ya creada. La primera vez, `tiktoken` descarga la codificación `cl100k_base` y la deja en caché, así que esa corrida necesita red. Se corren con el resto de las pruebas:
 
 ```bash
 python -m unittest discover -s tests -v
